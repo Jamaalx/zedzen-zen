@@ -137,8 +137,9 @@ ROL ${user.role.toUpperCase()}:
 ${user.role === "admin" ? "Acces TOTAL: comenzi, furnizori, useri, knowledge, config, logs, dispatch." : ""}
 ${user.role === "manager" ? "Acces: comenzi, furnizori, dispatch, sheets, onboarding, rapoarte. NU poate gestiona useri sau knowledge." : ""}
 ${user.role === "user" ? "Acces: vizualizare comenzi, furnizori, status, rapoarte, intrebari AI. NU poate dispatch, gestiona useri sau knowledge." : ""}
+${user.role === "guest" ? "Acces LIMITAT (guest fara autentificare): poate doar sa intrebe despre meniu, proceduri, informatii generale. Poate cauta in knowledge base. NU poate vedea comenzi, furnizori, useri, logs, dispatch sau alte actiuni. Daca cere ceva ce necesita autentificare, spune-i sa contacteze un administrator pentru a primi acces." : ""}
 
-Daca userul scrie "logout" sau "iesire", confirma deconectarea.`;
+${user.role !== "guest" ? "Daca userul scrie \"logout\" sau \"iesire\", confirma deconectarea." : ""}`;
 }
 
 // =============================================
@@ -205,29 +206,43 @@ export async function handleMessage(chatId: string, text: string): Promise<void>
   const db = getDb();
   const session = await getOrCreateSession(chatId);
 
-  // --- Not authenticated: expect PIN ---
+  // --- Not authenticated ---
   if (!session.is_authenticated) {
     const phone = chatId.replace("@s.whatsapp.net", "").replace("@c.us", "");
-    const { data: user } = await db.from("zen_users")
+    const { data: knownUser } = await db.from("zen_users")
       .select("*, org:zen_organizations(name)")
       .eq("phone", phone).eq("is_active", true).single();
 
-    if (!user) {
-      await sendText(chatId, "🔒 Nu ai acces. Contacteaza un administrator.");
+    if (knownUser) {
+      // Known user - check PIN
+      if (knownUser.pin !== text.trim()) {
+        await sendText(chatId, "🔑 PIN incorect.");
+        return;
+      }
+      const u = knownUser as User & { org?: { name: string } };
+      u.org_name = u.org?.name || "ZED-ZEN";
+      await authenticateSession(session, u);
+      await sendText(chatId, `✅ Bun venit, *${u.name}*! (${u.role})\n📍 ${u.org_name}\n\n🤖 Sunt ZEN, asistentul tau. Scrie orice - eu ma descurc.`);
+      await logAction(session, u, "login", "", "ok", "success", startTime);
       return;
     }
 
-    if (user.pin !== text.trim()) {
-      await sendText(chatId, "🔑 PIN incorect.");
-      return;
+    // Guest mode - anyone can chat with AI (limited tools)
+    const guest: User = {
+      id: "guest",
+      phone,
+      name: "Guest",
+      pin: "",
+      role: "guest",
+      is_active: true,
+      organization_id: null,
+    };
+    try {
+      const response = await runAgent(text, guest, chatId);
+      await sendText(chatId, response);
+    } catch (err) {
+      await sendText(chatId, `❌ Eroare: ${String(err)}`);
     }
-
-    const u = user as User & { org?: { name: string } };
-    u.org_name = u.org?.name || "ZED-ZEN";
-
-    await authenticateSession(session, u);
-    await sendText(chatId, `✅ Bun venit, *${u.name}*! (${u.role})\n📍 ${u.org_name}\n\n🤖 Sunt ZEN, asistentul tau. Scrie orice - eu ma descurc.`);
-    await logAction(session, user as User, "login", "", "ok", "success", startTime);
     return;
   }
 

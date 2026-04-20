@@ -199,6 +199,25 @@ export const toolSchemas: ChatCompletionTool[] = [
   {
     type: "function",
     function: {
+      name: "schedule_message",
+      description: "Programeaza un mesaj WhatsApp sa fie trimis la o anumita ora, o singura data sau zilnic/periodic. Doar admin.",
+      parameters: {
+        type: "object",
+        properties: {
+          to: { type: "string", description: "Numar telefon sau chat ID destinatar" },
+          message: { type: "string", description: "Textul mesajului" },
+          schedule_type: { type: "string", enum: ["once", "daily", "weekly"], description: "once=o singura data, daily=zilnic, weekly=saptamanal" },
+          time: { type: "string", description: "Ora trimitere format HH:MM (ex: 08:30)" },
+          days: { type: "string", description: "Zilele saptamanii separate prin virgula, 1=Luni..7=Duminica (ex: 1,2,3,4,5 pentru L-V). Doar pt daily/weekly." },
+          date: { type: "string", description: "Data trimitere YYYY-MM-DD (doar pt schedule_type=once)" },
+        },
+        required: ["to", "message", "schedule_type", "time"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
       name: "update_supplier",
       description: "Actualizeaza datele unui furnizor existent (telefon, email, persoana de contact, WhatsApp chat ID). Foloseste cand cineva vrea sa schimbe nr de telefon sau alte date la un furnizor.",
       parameters: {
@@ -239,8 +258,14 @@ export async function executeTool(name: string, args: Record<string, unknown>, u
   const orgFilter = organizationId || null;
 
   // Permission check for admin-only tools
-  const adminTools = ["add_knowledge", "edit_knowledge", "delete_knowledge", "list_users", "add_user", "edit_user", "view_logs"];
+  const adminTools = ["add_knowledge", "edit_knowledge", "delete_knowledge", "list_users", "add_user", "edit_user", "view_logs", "update_supplier", "schedule_message"];
   const managerTools = ["dispatch_orders", "check_sheets", "start_onboarding"];
+  const guestAllowed = ["search_knowledge", "list_knowledge"];
+
+  // Guest can only search knowledge
+  if (userRole === "guest" && !guestAllowed.includes(name)) {
+    return "EROARE: Aceasta actiune necesita autentificare. Contacteaza un administrator pentru a primi acces.";
+  }
 
   if (adminTools.includes(name) && userRole !== "admin") {
     return "EROARE: Aceasta actiune necesita rol admin.";
@@ -389,6 +414,40 @@ export async function executeTool(name: string, args: Record<string, unknown>, u
         if (orgFilter) q = q.eq("organization_id", orgFilter);
         const { data } = await q.order("created_at", { ascending: false }).limit(limit);
         return JSON.stringify(data);
+      }
+
+      // --- Scheduled Messages ---
+      case "schedule_message": {
+        const to = String(args.to);
+        const chatTarget = to.includes("@") ? to : to.replace(/[^0-9]/g, "").replace(/^0/, "40") + "@s.whatsapp.net";
+        const schedType = String(args.schedule_type || "once");
+        const time = String(args.time || "09:00");
+        const days = args.days ? String(args.days).split(",").map(Number) : [1, 2, 3, 4, 5];
+
+        // Calculate next_run_at
+        let nextRun: Date;
+        if (schedType === "once" && args.date) {
+          nextRun = new Date(`${args.date}T${time}:00+03:00`);
+        } else {
+          // Next occurrence at the specified time (Bucharest timezone)
+          const now = new Date();
+          nextRun = new Date(now.toLocaleDateString("en-US", { timeZone: "Europe/Bucharest" }) + " " + time + ":00");
+          if (nextRun <= now) nextRun.setDate(nextRun.getDate() + 1);
+        }
+
+        const { error } = await db.from("zen_scheduled_messages").insert({
+          organization_id: orgFilter,
+          to_chat_id: chatTarget,
+          message: String(args.message),
+          schedule_type: schedType,
+          schedule_time: time + ":00",
+          schedule_days: days,
+          next_run_at: nextRun.toISOString(),
+          is_active: true,
+        });
+
+        if (error) return `EROARE: ${error.message}`;
+        return `Mesaj programat: "${String(args.message).slice(0, 50)}..." catre ${to}, ${schedType === "once" ? `pe ${args.date || "maine"} la ${time}` : `${schedType} la ${time}${schedType !== "once" ? ` (zile: ${days.join(",")})` : ""}`}`;
       }
 
       // --- Suppliers ---
