@@ -1,12 +1,12 @@
 /**
- * ZEN Bot Core - authentication, command routing, session management.
- * This is the brain of the WhatsApp bot.
+ * ZEN Bot Core - full self-service WhatsApp agent.
+ * Auth, commands, AI (GPT-4o), knowledge mgmt, user mgmt - all from WhatsApp.
  */
 
 import { getDb } from "./supabase";
 import { sendText } from "./whapi";
 import * as manager from "./manager-api";
-import Anthropic from "@anthropic-ai/sdk";
+import OpenAI from "openai";
 
 // --- Types ---
 
@@ -44,14 +44,20 @@ interface Command {
 }
 
 const ROLE_HIERARCHY: Record<string, number> = { user: 0, manager: 1, admin: 2 };
-const SESSION_DURATION_MS = 24 * 60 * 60 * 1000; // 24h
+const SESSION_DURATION_MS = 24 * 60 * 60 * 1000;
 
-// --- Session Management ---
+let openai: OpenAI | null = null;
+function getOpenAI(): OpenAI {
+  if (!openai) openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+  return openai;
+}
+
+// =============================================
+// SESSION MANAGEMENT
+// =============================================
 
 async function getOrCreateSession(chatId: string): Promise<Session> {
   const db = getDb();
-
-  // Find active session
   const { data: existing } = await db
     .from("zen_sessions")
     .select("*")
@@ -64,7 +70,6 @@ async function getOrCreateSession(chatId: string): Promise<Session> {
 
   if (existing) return existing as Session;
 
-  // Create new unauthenticated session
   const { data: session } = await db
     .from("zen_sessions")
     .insert({ chat_id: chatId })
@@ -76,31 +81,28 @@ async function getOrCreateSession(chatId: string): Promise<Session> {
 
 async function authenticateSession(session: Session, user: User): Promise<void> {
   const db = getDb();
-  const expiresAt = new Date(Date.now() + SESSION_DURATION_MS).toISOString();
-
   await db
     .from("zen_sessions")
     .update({
       user_id: user.id,
       is_authenticated: true,
-      expires_at: expiresAt,
+      expires_at: new Date(Date.now() + SESSION_DURATION_MS).toISOString(),
       updated_at: new Date().toISOString(),
     })
     .eq("id", session.id);
 
-  await db
-    .from("zen_users")
-    .update({ last_login_at: new Date().toISOString() })
-    .eq("id", user.id);
+  await db.from("zen_users").update({ last_login_at: new Date().toISOString() }).eq("id", user.id);
 }
 
-// --- Command Resolution ---
+// =============================================
+// COMMAND RESOLUTION
+// =============================================
 
 async function resolveCommand(input: string): Promise<{ command: Command | null; args: string }> {
   const db = getDb();
   const text = input.trim();
   const firstWord = text.split(/\s+/)[0].toLowerCase().replace(/^[!/]/, "");
-  const args = text.slice(text.indexOf(" ") + 1).trim();
+  const rest = text.includes(" ") ? text.slice(text.indexOf(" ") + 1).trim() : "";
 
   const { data: commands } = await db
     .from("zen_commands")
@@ -110,37 +112,23 @@ async function resolveCommand(input: string): Promise<{ command: Command | null;
 
   if (!commands) return { command: null, args: text };
 
-  // Exact match on name
-  const exact = commands.find((c: Command) => c.name === firstWord);
-  if (exact) return { command: exact as Command, args: args === firstWord ? "" : args };
-
-  // Alias match
-  const aliased = commands.find((c: Command) =>
-    (c.aliases || []).some((a: string) => a === firstWord)
+  const match = commands.find(
+    (c: Command) => c.name === firstWord || (c.aliases || []).includes(firstWord)
   );
-  if (aliased) return { command: aliased as Command, args: args === firstWord ? "" : args };
 
-  // No command matched - treat as free text for AI
+  if (match) return { command: match as Command, args: rest };
   return { command: null, args: text };
 }
 
 function hasPermission(user: User, command: Command): boolean {
-  const userLevel = ROLE_HIERARCHY[user.role] ?? 0;
-  const requiredLevel = ROLE_HIERARCHY[command.required_role] ?? 0;
-  return userLevel >= requiredLevel;
+  return (ROLE_HIERARCHY[user.role] ?? 0) >= (ROLE_HIERARCHY[command.required_role] ?? 0);
 }
 
-// --- Log ---
+// =============================================
+// LOGGING
+// =============================================
 
-async function logCommand(
-  session: Session,
-  user: User | null,
-  command: string,
-  input: string,
-  output: string,
-  status: string,
-  startTime: number
-) {
+async function log(session: Session, user: User | null, command: string, input: string, output: string, status: string, startTime: number) {
   const db = getDb();
   await db.from("zen_logs").insert({
     session_id: session.id,
@@ -154,417 +142,472 @@ async function logCommand(
   });
 }
 
-// --- Built-in Command Handlers ---
+// =============================================
+// COMMAND HANDLERS
+// =============================================
 
 async function handleHelp(user: User): Promise<string> {
   const db = getDb();
-  const { data: commands } = await db
-    .from("zen_commands")
-    .select("name, description, category, required_role")
-    .eq("is_active", true)
-    .order("sort_order");
-
+  const { data: commands } = await db.from("zen_commands").select("*").eq("is_active", true).order("sort_order");
   if (!commands?.length) return "Nu sunt comenzi configurate.";
 
   const userLevel = ROLE_HIERARCHY[user.role] ?? 0;
-  const available = commands.filter(
-    (c: { required_role: string }) => (ROLE_HIERARCHY[c.required_role] ?? 0) <= userLevel
-  );
+  const available = commands.filter((c: Command) => (ROLE_HIERARCHY[c.required_role] ?? 0) <= userLevel);
 
-  const byCategory = new Map<string, Array<{ name: string; description: string }>>();
+  const cats = new Map<string, Command[]>();
   for (const c of available) {
-    const cat = (c as { category: string }).category;
-    if (!byCategory.has(cat)) byCategory.set(cat, []);
-    byCategory.get(cat)!.push(c as { name: string; description: string });
+    const cat = (c as Command).category;
+    if (!cats.has(cat)) cats.set(cat, []);
+    cats.get(cat)!.push(c as Command);
   }
 
-  const categoryEmoji: Record<string, string> = {
-    system: "⚙️",
-    orders: "📦",
-    suppliers: "🏭",
-    reports: "📊",
-    admin: "🔐",
-    general: "💬",
-  };
+  const emoji: Record<string, string> = { system: "⚙️", orders: "📦", suppliers: "🏭", reports: "📊", admin: "🔐", general: "💬", knowledge: "📚", users: "👥" };
 
-  let msg = "🤖 *ZEN Bot - Comenzi disponibile*\n";
-  for (const [cat, cmds] of byCategory) {
-    msg += `\n${categoryEmoji[cat] || "📌"} *${cat.toUpperCase()}*\n`;
-    for (const c of cmds) {
-      msg += `  /${c.name} - ${c.description}\n`;
-    }
+  let msg = "🤖 *ZEN Bot - Comenzi*\n";
+  for (const [cat, cmds] of cats) {
+    msg += `\n${emoji[cat] || "📌"} *${cat.toUpperCase()}*\n`;
+    for (const c of cmds) msg += `  /${c.name} - ${c.description}\n`;
   }
-  msg += `\n_Rol: ${user.role} | Sesiune: 24h_`;
+  msg += `\nSau scrie orice intrebare si AI-ul raspunde.\n_Rol: ${user.role} | Sesiune: 24h_`;
   return msg;
 }
 
-async function handleSystemStatus(): Promise<string> {
+async function handleStatus(): Promise<string> {
   const db = getDb();
-  const { count: userCount } = await db.from("zen_users").select("*", { count: "exact", head: true }).eq("is_active", true);
-  const { count: sessionCount } = await db.from("zen_sessions").select("*", { count: "exact", head: true }).eq("is_authenticated", true).gt("expires_at", new Date().toISOString());
-  const { count: logCount } = await db.from("zen_logs").select("*", { count: "exact", head: true });
+  const [users, sessions, logs, knowledge] = await Promise.all([
+    db.from("zen_users").select("*", { count: "exact", head: true }).eq("is_active", true),
+    db.from("zen_sessions").select("*", { count: "exact", head: true }).eq("is_authenticated", true).gt("expires_at", new Date().toISOString()),
+    db.from("zen_logs").select("*", { count: "exact", head: true }),
+    db.from("zen_knowledge").select("*", { count: "exact", head: true }).eq("is_active", true),
+  ]);
 
-  // Check manager API
-  let managerStatus = "❌ offline";
+  let managerOk = false;
   try {
-    const res = await fetch(`${process.env.MANAGER_API_URL || "https://manager.zed-zen.com"}/api/health`);
-    if (res.ok) managerStatus = "✅ online";
-  } catch { /* offline */ }
+    const res = await fetch(`${process.env.MANAGER_API_URL}/api/health`);
+    managerOk = res.ok;
+  } catch { /* */ }
 
   return `📊 *Status ZEN Bot*
 
 🟢 Bot: online
-${managerStatus.startsWith("✅") ? "🟢" : "🔴"} Manager API: ${managerStatus}
-👥 Utilizatori: ${userCount || 0}
-🔑 Sesiuni active: ${sessionCount || 0}
-📝 Total comenzi executate: ${logCount || 0}
+${managerOk ? "🟢" : "🔴"} Manager API: ${managerOk ? "online" : "offline"}
+👥 Utilizatori: ${users.count || 0}
+🔑 Sesiuni active: ${sessions.count || 0}
+📝 Comenzi executate: ${logs.count || 0}
+📚 Knowledge base: ${knowledge.count || 0} articole
 🕐 ${new Date().toLocaleString("ro-RO", { timeZone: "Europe/Bucharest" })}`;
 }
 
-async function handleTodayOrders(): Promise<string> {
+async function handleOrders(): Promise<string> {
   try {
     const data = await manager.triggerSheets();
-    if (data.error) return `❌ Eroare: ${data.error}`;
-
+    if (data.error) return `❌ ${data.error}`;
     let msg = "📦 *Comenzi azi*\n\n";
     if (data.message) msg += data.message;
-    if (data.orders_processed !== undefined) msg += `\nComenzi procesate: ${data.orders_processed}`;
-    if (data.items_created !== undefined) msg += `\nProduse gasite: ${data.items_created}`;
-    return msg || "📦 Nicio comanda noua astazi.";
+    if (data.orders_processed !== undefined) msg += `\nProcesate: ${data.orders_processed}`;
+    if (data.items_created !== undefined) msg += `\nProduse: ${data.items_created}`;
+    return msg;
   } catch (err) {
-    return `❌ Eroare la verificare comenzi: ${String(err)}`;
+    return `❌ ${err}`;
   }
 }
 
-async function handleListSuppliers(): Promise<string> {
+async function handleSuppliers(): Promise<string> {
   try {
-    const res = await fetch(`${process.env.MANAGER_API_URL || "https://manager.zed-zen.com"}/api/suppliers`, {
+    const res = await fetch(`${process.env.MANAGER_API_URL}/api/suppliers`, {
       headers: { Authorization: `Bearer ${process.env.MANAGER_CRON_SECRET}` },
     });
     const suppliers = await res.json();
+    if (!Array.isArray(suppliers) || !suppliers.length) return "Niciun furnizor.";
 
-    if (!Array.isArray(suppliers) || suppliers.length === 0) {
-      return "Nu sunt furnizori in baza de date.";
-    }
-
-    let msg = "🏭 *Furnizori activi*\n\n";
+    let msg = "🏭 *Furnizori*\n\n";
     for (const s of suppliers) {
-      const phone = s.phone ? `📱 ${s.phone}` : "❌ fara tel";
-      const contact = s.contact_name ? `👤 ${s.contact_name}` : "";
-      msg += `• *${s.name}* (${s.category})\n  ${phone} ${contact}\n`;
+      const p = s.phone ? `📱${s.phone}` : "❌ fara tel";
+      const c = s.contact_name ? ` 👤${s.contact_name}` : "";
+      msg += `• *${s.name}* (${s.category}) ${p}${c}\n`;
     }
     return msg;
   } catch {
-    return "❌ Nu pot accesa lista de furnizori. Manager API offline?";
+    return "❌ Manager API offline.";
   }
 }
 
-async function handleTriggerDispatch(): Promise<string> {
+async function handleDispatch(): Promise<string> {
   try {
     const data = await manager.triggerDispatch();
-    if (data.error) return `❌ Eroare dispatch: ${data.error}`;
-    return `✅ *Dispatch executat*\n${data.message || JSON.stringify(data)}`;
+    return data.error ? `❌ ${data.error}` : `✅ *Dispatch executat*\n${data.message || JSON.stringify(data)}`;
   } catch (err) {
-    return `❌ Eroare: ${String(err)}`;
+    return `❌ ${err}`;
   }
 }
 
-async function handleTriggerSheets(): Promise<string> {
+async function handleSheets(): Promise<string> {
   try {
     const data = await manager.triggerSheets();
-    if (data.error) return `❌ Eroare sheets: ${data.error}`;
-    return `✅ *Sheets verificat*\n${data.message || JSON.stringify(data)}`;
+    return data.error ? `❌ ${data.error}` : `✅ *Sheets verificat*\n${data.message || JSON.stringify(data)}`;
   } catch (err) {
-    return `❌ Eroare: ${String(err)}`;
+    return `❌ ${err}`;
   }
 }
 
-async function handleStartOnboarding(chatId: string): Promise<string> {
+async function handleOnboarding(chatId: string): Promise<string> {
   try {
     const data = await manager.startOnboarding(chatId);
-    return data.started
-      ? `✅ ${data.message}`
-      : `ℹ️ ${data.message}`;
+    return data.started ? `✅ ${data.message}` : `ℹ️ ${data.message}`;
   } catch (err) {
-    return `❌ Eroare onboarding: ${String(err)}`;
+    return `❌ ${err}`;
   }
 }
 
-async function handleDailyReport(): Promise<string> {
-  // Combine multiple data sources
-  const [ordersResult, statusResult] = await Promise.allSettled([
-    handleTodayOrders(),
-    handleSystemStatus(),
-  ]);
-
-  const orders = ordersResult.status === "fulfilled" ? ordersResult.value : "❌ Eroare comenzi";
-  const status = statusResult.status === "fulfilled" ? statusResult.value : "❌ Eroare status";
-
-  return `📊 *Raport Zilnic - ${new Date().toLocaleDateString("ro-RO", { timeZone: "Europe/Bucharest" })}*\n\n${orders}\n\n━━━━━━━━━━━━━━━\n\n${status}`;
+async function handleReport(): Promise<string> {
+  const [orders, status] = await Promise.allSettled([handleOrders(), handleStatus()]);
+  return `📊 *Raport - ${new Date().toLocaleDateString("ro-RO", { timeZone: "Europe/Bucharest" })}*\n\n${orders.status === "fulfilled" ? orders.value : "❌"}\n\n━━━━━━━━━━━━\n\n${status.status === "fulfilled" ? status.value : "❌"}`;
 }
 
-async function handleAddUser(args: string, chatId: string): Promise<string> {
+// =============================================
+// USER MANAGEMENT (admin)
+// =============================================
+
+async function handleAddUser(args: string): Promise<string> {
+  if (!args || args.split(/\s+/).length < 3) {
+    return `👥 *Adauga utilizator*\n\nFormat: /adduser [tel] [nume] [pin] [rol]\nRoluri: user, manager, admin\n\nEx: /adduser 0722123456 Maria 5678 manager`;
+  }
+
   const parts = args.split(/\s+/);
-  if (parts.length < 3) {
-    return "Format: /adduser [telefon] [nume] [pin] [rol]\nExemplu: /adduser 0722123456 Maria 5678 manager";
-  }
-
   const [phone, name, pin, role] = parts;
   const cleanPhone = phone.replace(/[^0-9]/g, "").replace(/^0/, "40");
   const userRole = role && ["user", "manager", "admin"].includes(role) ? role : "user";
 
   const db = getDb();
-  const { error } = await db.from("zen_users").insert({
-    phone: cleanPhone,
-    name,
-    pin,
-    role: userRole,
-  });
+  const { error } = await db.from("zen_users").insert({ phone: cleanPhone, name, pin, role: userRole });
 
-  if (error) {
-    if (error.code === "23505") return `❌ Utilizatorul ${phone} exista deja.`;
-    return `❌ Eroare: ${error.message}`;
-  }
+  if (error) return error.code === "23505" ? `❌ ${phone} exista deja.` : `❌ ${error.message}`;
 
-  // Send welcome message to new user
-  await sendText(cleanPhone, `🤖 Bun venit la *ZEN Bot*!\n\nAi fost adaugat de un administrator.\nPIN-ul tau este: *${pin}*\n\nTrimite PIN-ul pentru a te autentifica.`);
-
-  return `✅ Utilizator adaugat: *${name}* (${cleanPhone}) - ${userRole}\nI-am trimis mesaj de bun venit.`;
+  await sendText(cleanPhone, `🤖 Bun venit la *ZEN Bot*!\n\nPIN-ul tau: *${pin}*\nTrimite PIN-ul pentru a te autentifica.`);
+  return `✅ *${name}* (${cleanPhone}) adaugat ca ${userRole}. I-am trimis mesaj.`;
 }
 
-async function handleViewLogs(): Promise<string> {
+async function handleListUsers(): Promise<string> {
   const db = getDb();
-  const { data: logs } = await db
-    .from("zen_logs")
-    .select("user_phone, command, status, execution_ms, created_at")
-    .order("created_at", { ascending: false })
-    .limit(10);
+  const { data: users } = await db.from("zen_users").select("phone, name, role, is_active, last_login_at").order("name");
+  if (!users?.length) return "Niciun utilizator.";
 
-  if (!logs?.length) return "📝 Niciun log inregistrat.";
-
-  let msg = "📝 *Ultimele 10 actiuni*\n\n";
-  for (const log of logs) {
-    const time = new Date(log.created_at).toLocaleString("ro-RO", { timeZone: "Europe/Bucharest", hour: "2-digit", minute: "2-digit" });
-    const icon = log.status === "success" ? "✅" : "❌";
-    msg += `${icon} ${time} - /${log.command} (${log.user_phone?.slice(-4)}) ${log.execution_ms}ms\n`;
+  let msg = "👥 *Utilizatori ZEN*\n\n";
+  for (const u of users) {
+    const status = u.is_active ? "🟢" : "🔴";
+    const lastLogin = u.last_login_at ? new Date(u.last_login_at).toLocaleDateString("ro-RO", { timeZone: "Europe/Bucharest" }) : "niciodata";
+    msg += `${status} *${u.name}* (${u.phone}) - ${u.role}\n    Ultima conectare: ${lastLogin}\n`;
   }
   return msg;
 }
 
-async function handleConfigMenu(): Promise<string> {
-  return `⚙️ *Setari sistem*
+async function handleEditUser(args: string): Promise<string> {
+  if (!args) return `✏️ *Editeaza utilizator*\n\nFormat: /edituser [tel] [camp] [valoare]\nCampuri: name, pin, role, active\n\nEx:\n/edituser 0722123456 role admin\n/edituser 0722123456 pin 9999\n/edituser 0722123456 active off`;
 
-Trimite comanda dorita:
-• /config ore [HH:MM] - Seteaza ora trimitere formular
-• /config zile [1,2,3,4,5] - Zile active (1=Luni)
-• /config sheet [ID] - Seteaza Google Sheet ID
-• /config activ [on/off] - Activeaza/dezactiveaza comenzi
+  const parts = args.split(/\s+/);
+  if (parts.length < 3) return "Format: /edituser [tel] [camp] [valoare]";
 
-_Exemplu: /config ore 08:30_`;
-}
+  const [phone, field, ...valueParts] = parts;
+  const value = valueParts.join(" ");
+  const cleanPhone = phone.replace(/[^0-9]/g, "").replace(/^0/, "40");
 
-async function handleToggleActive(args: string): Promise<string> {
-  const activate = ["on", "da", "yes", "1", "activ"].includes(args.toLowerCase());
-  const deactivate = ["off", "nu", "no", "0", "inactiv"].includes(args.toLowerCase());
+  const db = getDb();
+  const updateData: Record<string, unknown> = { updated_at: new Date().toISOString() };
 
-  if (!activate && !deactivate) {
-    return "Foloseste: /activare on sau /activare off";
+  switch (field) {
+    case "name": updateData.name = value; break;
+    case "pin": updateData.pin = value; break;
+    case "role":
+      if (!["user", "manager", "admin"].includes(value)) return "❌ Rol invalid. Optiuni: user, manager, admin";
+      updateData.role = value;
+      break;
+    case "active":
+      updateData.is_active = ["on", "da", "yes", "true", "1"].includes(value.toLowerCase());
+      break;
+    default:
+      return `❌ Camp necunoscut: ${field}. Optiuni: name, pin, role, active`;
   }
 
-  // TODO: call manager API to toggle config
-  return activate
-    ? "✅ Sistemul de comenzi a fost *activat*."
-    : "⏸ Sistemul de comenzi a fost *dezactivat*.";
+  const { data, error } = await db.from("zen_users").update(updateData).eq("phone", cleanPhone).select("name").single();
+  if (error || !data) return `❌ Utilizatorul ${phone} nu a fost gasit.`;
+
+  return `✅ *${data.name}* actualizat: ${field} = ${value}`;
 }
 
-async function handleLogout(session: Session): Promise<string> {
+async function handleDeleteUser(args: string): Promise<string> {
+  if (!args) return "Format: /deluser [telefon]";
+
+  const cleanPhone = args.trim().replace(/[^0-9]/g, "").replace(/^0/, "40");
   const db = getDb();
-  await db
-    .from("zen_sessions")
-    .update({ is_authenticated: false, updated_at: new Date().toISOString() })
-    .eq("id", session.id);
-  return "👋 Te-ai deconectat. Trimite PIN-ul pentru a te reconecta.";
+
+  const { data, error } = await db.from("zen_users").update({ is_active: false, updated_at: new Date().toISOString() }).eq("phone", cleanPhone).select("name").single();
+  if (error || !data) return `❌ Utilizatorul nu a fost gasit.`;
+
+  return `✅ *${data.name}* dezactivat.`;
 }
 
-// --- AI Query (grounded in knowledge base) ---
+// =============================================
+// KNOWLEDGE BASE MANAGEMENT (admin)
+// =============================================
 
-async function handleAiQuery(query: string): Promise<string> {
+async function handleKnowledge(args: string): Promise<string> {
   const db = getDb();
 
-  // Load knowledge base
-  const { data: knowledge } = await db
-    .from("zen_knowledge")
-    .select("category, title, content")
-    .eq("is_active", true);
+  if (!args) {
+    const { data } = await db.from("zen_knowledge").select("id, category, title").eq("is_active", true).order("category");
+    if (!data?.length) return "📚 Knowledge base gol.";
 
-  const knowledgeText = (knowledge || [])
+    let msg = "📚 *Knowledge Base*\n\n";
+    let lastCat = "";
+    for (const k of data) {
+      if (k.category !== lastCat) {
+        msg += `\n*${k.category.toUpperCase()}*\n`;
+        lastCat = k.category;
+      }
+      msg += `  ${k.id.slice(0, 6)} - ${k.title}\n`;
+    }
+    msg += "\nComenzi:\n/kb add [categorie] [titlu] | [continut]\n/kb edit [id] | [continut nou]\n/kb del [id]\n/kb view [id]";
+    return msg;
+  }
+
+  const subCmd = args.split(/\s+/)[0].toLowerCase();
+  const subArgs = args.slice(subCmd.length).trim();
+
+  switch (subCmd) {
+    case "add": {
+      const pipeIdx = subArgs.indexOf("|");
+      if (pipeIdx === -1) return "Format: /kb add [categorie] [titlu] | [continut]\nEx: /kb add procedures Checklist dimineata | 1. Verificare stoc 2. Curatenie 3. Mise en place";
+
+      const header = subArgs.slice(0, pipeIdx).trim();
+      const content = subArgs.slice(pipeIdx + 1).trim();
+      const headerParts = header.split(/\s+/);
+      const category = headerParts[0];
+      const title = headerParts.slice(1).join(" ");
+
+      if (!category || !title || !content) return "❌ Toate campurile sunt obligatorii.";
+
+      const { data, error } = await db.from("zen_knowledge").insert({ category, title, content }).select("id").single();
+      if (error) return `❌ ${error.message}`;
+      return `✅ Articol adaugat: *${title}* (${category})\nID: ${data.id.slice(0, 8)}`;
+    }
+
+    case "edit": {
+      const pipeIdx = subArgs.indexOf("|");
+      if (pipeIdx === -1) return "Format: /kb edit [id] | [continut nou]";
+
+      const id = subArgs.slice(0, pipeIdx).trim();
+      const content = subArgs.slice(pipeIdx + 1).trim();
+
+      const { data, error } = await db.from("zen_knowledge").update({ content, updated_at: new Date().toISOString() }).ilike("id", `${id}%`).select("title").single();
+      if (error || !data) return `❌ Articol negasit cu ID ${id}`;
+      return `✅ *${data.title}* actualizat.`;
+    }
+
+    case "del":
+    case "delete": {
+      const id = subArgs.trim();
+      const { data, error } = await db.from("zen_knowledge").update({ is_active: false }).ilike("id", `${id}%`).select("title").single();
+      if (error || !data) return `❌ Articol negasit.`;
+      return `✅ *${data.title}* sters.`;
+    }
+
+    case "view": {
+      const id = subArgs.trim();
+      const { data } = await db.from("zen_knowledge").select("*").ilike("id", `${id}%`).single();
+      if (!data) return `❌ Articol negasit.`;
+      return `📚 *${data.title}*\nCategorie: ${data.category}\n\n${data.content}`;
+    }
+
+    default:
+      return "Subcomenzi: /kb add, /kb edit, /kb del, /kb view\nSau /kb fara argumente pt lista.";
+  }
+}
+
+// =============================================
+// LOGS
+// =============================================
+
+async function handleLogs(args: string): Promise<string> {
+  const db = getDb();
+  const limit = parseInt(args) || 15;
+
+  const { data: logs } = await db
+    .from("zen_logs")
+    .select("user_phone, command, status, execution_ms, created_at")
+    .order("created_at", { ascending: false })
+    .limit(limit);
+
+  if (!logs?.length) return "📝 Niciun log.";
+
+  let msg = `📝 *Ultimele ${logs.length} actiuni*\n\n`;
+  for (const l of logs) {
+    const time = new Date(l.created_at).toLocaleString("ro-RO", { timeZone: "Europe/Bucharest", hour: "2-digit", minute: "2-digit" });
+    msg += `${l.status === "success" ? "✅" : "❌"} ${time} /${l.command} (${l.user_phone?.slice(-4)}) ${l.execution_ms}ms\n`;
+  }
+  return msg;
+}
+
+// =============================================
+// CONFIG
+// =============================================
+
+async function handleConfig(args: string): Promise<string> {
+  if (!args) {
+    return `⚙️ *Setari sistem*\n\n/config ore [HH:MM] - Ora trimitere formular\n/config zile [1,2,3,4,5] - Zile active\n/config sheet [ID] - Google Sheet ID\n/config activ [on/off] - Pornire/oprire sistem\n\nEx: /config ore 08:30`;
+  }
+
+  const [sub, ...rest] = args.split(/\s+/);
+  const value = rest.join(" ");
+
+  // TODO: implement actual config changes via manager API
+  return `⚙️ Config *${sub}* setat la: ${value}\n_(implementare in curs)_`;
+}
+
+// =============================================
+// AI QUERY (GPT-4o, grounded in knowledge base)
+// =============================================
+
+async function handleAi(query: string): Promise<string> {
+  const db = getDb();
+
+  const { data: knowledge } = await db.from("zen_knowledge").select("category, title, content").eq("is_active", true);
+
+  const kb = (knowledge || [])
     .map((k: { category: string; title: string; content: string }) => `[${k.category}] ${k.title}: ${k.content}`)
     .join("\n\n");
 
-  const apiKey = process.env.ANTHROPIC_API_KEY;
-  if (!apiKey) return "❌ AI nu este configurat (lipseste ANTHROPIC_API_KEY).";
+  if (!process.env.OPENAI_API_KEY) return "❌ AI nu e configurat (OPENAI_API_KEY lipseste).";
 
   try {
-    const client = new Anthropic({ apiKey });
-    const response = await client.messages.create({
-      model: "claude-sonnet-4-20250514",
+    const ai = getOpenAI();
+    const res = await ai.chat.completions.create({
+      model: "gpt-4o",
+      temperature: 0.3,
       max_tokens: 500,
-      system: `Esti ZEN, asistentul inteligent al restaurantului Ciorbe si Placinte. Raspunzi DOAR pe baza informatiilor de mai jos. Daca nu stii raspunsul, spune clar ca nu ai informatia. Comunici in romana, concis si profesional.
+      messages: [
+        {
+          role: "system",
+          content: `Esti ZEN, asistentul AI al restaurantului Ciorbe si Placinte. Raspunzi STRICT pe baza informatiilor din baza de cunostinte. Daca nu ai informatia, spune clar "Nu am aceasta informatie in baza de cunostinte." NU inventa. Comunici in romana, concis, profesional.
 
 BAZA DE CUNOSTINTE:
-${knowledgeText}
+${kb}
 
 REGULI:
-- NU inventa informatii
-- Raspunde scurt si la obiect (max 3-4 propozitii)
-- Daca intrebarea nu e despre business, proceduri sau furnizori, refuza politicos
-- Mentioneaza sursa daca e relevant (ex: "conform procedurii de comenzi...")`,
-      messages: [{ role: "user", content: query }],
+- Max 3-4 propozitii
+- Daca nu e despre business/proceduri/furnizori, refuza politicos
+- Citeaza sursa daca e relevant`,
+        },
+        { role: "user", content: query },
+      ],
     });
 
-    const text = response.content[0];
-    if (text.type === "text") return `🧠 ${text.text}`;
-    return "❌ Nu am putut genera un raspuns.";
+    const text = res.choices[0]?.message?.content;
+    return text ? `🧠 ${text}` : "❌ Fara raspuns.";
   } catch (err) {
-    return `❌ Eroare AI: ${String(err)}`;
+    return `❌ AI error: ${String(err)}`;
   }
 }
 
-// --- Main Message Handler ---
+// =============================================
+// LOGOUT
+// =============================================
+
+async function handleLogout(session: Session): Promise<string> {
+  const db = getDb();
+  await db.from("zen_sessions").update({ is_authenticated: false, updated_at: new Date().toISOString() }).eq("id", session.id);
+  return "👋 Deconectat. Trimite PIN-ul pentru reconectare.";
+}
+
+// =============================================
+// MAIN MESSAGE HANDLER
+// =============================================
 
 export async function handleMessage(chatId: string, text: string): Promise<void> {
   const startTime = Date.now();
   const db = getDb();
   const session = await getOrCreateSession(chatId);
 
-  // --- Not authenticated: expect PIN ---
+  // --- Not authenticated ---
   if (!session.is_authenticated) {
-    const pin = text.trim();
-
-    // Find user by phone (extract from chat_id)
     const phone = chatId.replace("@s.whatsapp.net", "").replace("@c.us", "");
 
-    const { data: user } = await db
-      .from("zen_users")
-      .select("*")
-      .eq("phone", phone)
-      .eq("is_active", true)
-      .single();
+    const { data: user } = await db.from("zen_users").select("*").eq("phone", phone).eq("is_active", true).single();
 
     if (!user) {
-      await sendText(chatId, "🔒 Nu ai acces la ZEN Bot. Contacteaza un administrator.");
+      await sendText(chatId, "🔒 Nu ai acces. Contacteaza un administrator.");
       return;
     }
 
-    if (user.pin !== pin) {
-      await sendText(chatId, "🔑 PIN incorect. Incearca din nou.");
+    if (user.pin !== text.trim()) {
+      await sendText(chatId, "🔑 PIN incorect.");
       return;
     }
 
-    // Authenticate
     await authenticateSession(session, user as User);
-    await sendText(chatId, `✅ Bun venit, *${user.name}*! (${user.role})\n\nScrie /help pentru lista de comenzi.`);
-    await logCommand(session, user as User, "login", "", "success", "success", startTime);
+    await sendText(chatId, `✅ Bun venit, *${user.name}*! (${user.role})\n\nScrie help sau orice intrebare.`);
+    await log(session, user as User, "login", "", "ok", "success", startTime);
     return;
   }
 
   // --- Authenticated ---
-  const { data: user } = await db
-    .from("zen_users")
-    .select("*")
-    .eq("id", session.user_id)
-    .single();
-
+  const { data: user } = await db.from("zen_users").select("*").eq("id", session.user_id).single();
   if (!user) {
-    await sendText(chatId, "❌ Eroare sesiune. Trimite PIN-ul pentru reconectare.");
+    await sendText(chatId, "❌ Sesiune invalida. Trimite PIN-ul.");
     await db.from("zen_sessions").update({ is_authenticated: false }).eq("id", session.id);
     return;
   }
 
-  // Check for active flow (onboarding, config wizard, etc.)
-  if (session.active_flow) {
-    // TODO: route to flow handlers
-    // For now, clear flow on any non-flow message
-    await db.from("zen_sessions").update({ active_flow: null, flow_state: {} }).eq("id", session.id);
-  }
-
-  // Resolve command
   const { command, args } = await resolveCommand(text);
 
-  // If no command matched, use AI
+  // No command → AI
   if (!command) {
-    const response = await handleAiQuery(text);
+    const response = await handleAi(text);
     await sendText(chatId, response);
-    await logCommand(session, user as User, "ai_query", text, response, "success", startTime);
+    await log(session, user as User, "ai", text, response, "success", startTime);
     return;
   }
 
-  // Check permission
+  // Permission check
   if (!hasPermission(user as User, command)) {
-    const msg = `🚫 Nu ai permisiunea pentru /${command.name}. Necesita rol: ${command.required_role}`;
+    const msg = `🚫 Acces interzis. /${command.name} necesita rol: ${command.required_role}`;
     await sendText(chatId, msg);
-    await logCommand(session, user as User, command.name, text, msg, "denied", startTime);
+    await log(session, user as User, command.name, text, msg, "denied", startTime);
     return;
   }
 
-  // Execute command
+  // Execute
   let response: string;
   try {
     const handler = (command.handler_config as { handler: string }).handler;
 
     switch (handler) {
-      case "help":
-        response = await handleHelp(user as User);
-        break;
-      case "system_status":
-        response = await handleSystemStatus();
-        break;
-      case "today_orders":
-        response = await handleTodayOrders();
-        break;
-      case "list_suppliers":
-        response = await handleListSuppliers();
-        break;
-      case "trigger_dispatch":
-        response = await handleTriggerDispatch();
-        break;
-      case "trigger_sheets":
-        response = await handleTriggerSheets();
-        break;
-      case "start_onboarding":
-        response = await handleStartOnboarding(chatId);
-        break;
-      case "daily_report":
-        response = await handleDailyReport();
-        break;
-      case "config_menu":
-        response = await handleConfigMenu();
-        break;
-      case "toggle_active":
-        response = await handleToggleActive(args);
-        break;
-      case "add_user":
-        response = await handleAddUser(args, chatId);
-        break;
-      case "view_logs":
-        response = await handleViewLogs();
-        break;
-      case "ai_query":
-        response = await handleAiQuery(args);
-        break;
-      case "logout":
-        response = await handleLogout(session);
-        break;
-      default:
-        response = `❌ Handler necunoscut: ${handler}`;
+      case "help": response = await handleHelp(user as User); break;
+      case "system_status": response = await handleStatus(); break;
+      case "today_orders": response = await handleOrders(); break;
+      case "list_suppliers": response = await handleSuppliers(); break;
+      case "trigger_dispatch": response = await handleDispatch(); break;
+      case "trigger_sheets": response = await handleSheets(); break;
+      case "start_onboarding": response = await handleOnboarding(chatId); break;
+      case "daily_report": response = await handleReport(); break;
+      case "config_menu": response = await handleConfig(args); break;
+      case "toggle_active": response = await handleConfig(`activ ${args}`); break;
+      case "add_user": response = await handleAddUser(args); break;
+      case "list_users": response = await handleListUsers(); break;
+      case "edit_user": response = await handleEditUser(args); break;
+      case "delete_user": response = await handleDeleteUser(args); break;
+      case "knowledge": response = await handleKnowledge(args); break;
+      case "view_logs": response = await handleLogs(args); break;
+      case "ai_query": response = await handleAi(args); break;
+      case "logout": response = await handleLogout(session); break;
+      default: response = `❌ Handler necunoscut: ${handler}`;
     }
   } catch (err) {
-    response = `❌ Eroare la executare: ${String(err)}`;
-    await logCommand(session, user as User, command.name, text, response, "error", startTime);
+    response = `❌ Eroare: ${String(err)}`;
+    await log(session, user as User, command.name, text, response, "error", startTime);
     await sendText(chatId, response);
     return;
   }
 
   await sendText(chatId, response);
-  await logCommand(session, user as User, command.name, text, response, "success", startTime);
+  await log(session, user as User, command.name, text, response, "success", startTime);
 }
