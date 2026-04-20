@@ -199,6 +199,36 @@ export const toolSchemas: ChatCompletionTool[] = [
   {
     type: "function",
     function: {
+      name: "nexus_clients_balances",
+      description: "Vezi toti clientii cu soldurile si restantele lor din ERP-ul Nexus. Arata cine datoreaza bani, cine e la zi, si sumele restante. Doar admin.",
+      parameters: { type: "object", properties: {}, required: [] },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "nexus_client_invoices",
+      description: "Vezi facturile unui client specific din Nexus ERP - sume, scadente, zile intarziere, rest de plata. Doar admin.",
+      parameters: {
+        type: "object",
+        properties: {
+          client_name: { type: "string", description: "Numele clientului (sau parte din nume)" },
+        },
+        required: ["client_name"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "nexus_overdue_summary",
+      description: "Sumar rapid: cati clienti au restante, suma totala restanta, top 5 restantieri. Doar admin.",
+      parameters: { type: "object", properties: {}, required: [] },
+    },
+  },
+  {
+    type: "function",
+    function: {
       name: "schedule_message",
       description: "Programeaza un mesaj WhatsApp sa fie trimis la o anumita ora, o singura data sau zilnic/periodic. Doar admin.",
       parameters: {
@@ -258,7 +288,7 @@ export async function executeTool(name: string, args: Record<string, unknown>, u
   const orgFilter = organizationId || null;
 
   // Permission check for admin-only tools
-  const adminTools = ["add_knowledge", "edit_knowledge", "delete_knowledge", "list_users", "add_user", "edit_user", "view_logs", "update_supplier", "schedule_message"];
+  const adminTools = ["add_knowledge", "edit_knowledge", "delete_knowledge", "list_users", "add_user", "edit_user", "view_logs", "update_supplier", "schedule_message", "nexus_clients_balances", "nexus_client_invoices", "nexus_overdue_summary"];
   const managerTools = ["dispatch_orders", "check_sheets", "start_onboarding"];
   const guestAllowed = ["search_knowledge", "list_knowledge"];
 
@@ -414,6 +444,93 @@ export async function executeTool(name: string, args: Record<string, unknown>, u
         if (orgFilter) q = q.eq("organization_id", orgFilter);
         const { data } = await q.order("created_at", { ascending: false }).limit(limit);
         return JSON.stringify(data);
+      }
+
+      // --- Nexus ERP ---
+      case "nexus_clients_balances": {
+        const NEXUS_URL = process.env.NEXUS_API_URL || "http://86.125.184.78:8008";
+        const NEXUS_KEY = process.env.NEXUS_API_KEY || "60E12DA32A7A4D10A8555253363ACFF4";
+        const auth = Buffer.from(NEXUS_KEY + ":").toString("base64");
+        const headers = { Authorization: `Basic ${auth}`, "Content-Type": "application/json" };
+
+        const res = await fetch(`${NEXUS_URL}/api/v3/read/sold_clienti`, {
+          method: "POST", headers, body: "{}",
+        });
+        const data = await res.json();
+        if (!Array.isArray(data)) return `EROARE: ${JSON.stringify(data)}`;
+
+        const clients = data
+          .filter((c: { restanta?: number; sold?: number }) => (c.restanta || 0) !== 0 || (c.sold || 0) !== 0)
+          .map((c: { nume_client: string; restanta: number; sold: number; intarziere: number }) => ({
+            client: c.nume_client,
+            restanta: c.restanta || 0,
+            sold: c.sold || 0,
+            zile_intarziere: c.intarziere || 0,
+          }))
+          .sort((a: { restanta: number }, b: { restanta: number }) => b.restanta - a.restanta);
+
+        return JSON.stringify({ total_clienti: clients.length, clienti: clients.slice(0, 20) });
+      }
+
+      case "nexus_client_invoices": {
+        const NEXUS_URL = process.env.NEXUS_API_URL || "http://86.125.184.78:8008";
+        const NEXUS_KEY = process.env.NEXUS_API_KEY || "60E12DA32A7A4D10A8555253363ACFF4";
+        const auth = Buffer.from(NEXUS_KEY + ":").toString("base64");
+        const headers = { Authorization: `Basic ${auth}`, "Content-Type": "application/json" };
+
+        // Get all invoices
+        const res = await fetch(`${NEXUS_URL}/api/v3/read/facturi_clienti`, {
+          method: "POST", headers, body: "{}",
+        });
+        const data = await res.json();
+        if (!Array.isArray(data)) return `EROARE: ${JSON.stringify(data)}`;
+
+        const searchName = String(args.client_name).toLowerCase();
+        const invoices = data
+          .filter((f: { den_client: string }) => f.den_client?.toLowerCase().includes(searchName))
+          .map((f: { den_client: string; serie_document: string; numar_document: string; data_document: string; data_lim: string; valoare_cu_tva: number; valoare_incasata: number; sold: number; stare_factura: string }) => ({
+            client: f.den_client,
+            factura: `${f.serie_document || ""}${f.numar_document || ""}`,
+            data: f.data_document,
+            scadenta: f.data_lim,
+            valoare: f.valoare_cu_tva,
+            incasat: f.valoare_incasata,
+            rest: f.sold,
+            stare: f.stare_factura,
+          }));
+
+        if (!invoices.length) return `Nu am gasit facturi pentru "${args.client_name}".`;
+        return JSON.stringify({ client: args.client_name, facturi: invoices.slice(0, 15) });
+      }
+
+      case "nexus_overdue_summary": {
+        const NEXUS_URL = process.env.NEXUS_API_URL || "http://86.125.184.78:8008";
+        const NEXUS_KEY = process.env.NEXUS_API_KEY || "60E12DA32A7A4D10A8555253363ACFF4";
+        const auth = Buffer.from(NEXUS_KEY + ":").toString("base64");
+        const headers = { Authorization: `Basic ${auth}`, "Content-Type": "application/json" };
+
+        const res = await fetch(`${NEXUS_URL}/api/v3/read/sold_clienti`, {
+          method: "POST", headers, body: "{}",
+        });
+        const data = await res.json();
+        if (!Array.isArray(data)) return `EROARE: ${JSON.stringify(data)}`;
+
+        const overdue = data
+          .filter((c: { restanta?: number }) => (c.restanta || 0) > 0)
+          .sort((a: { restanta: number }, b: { restanta: number }) => b.restanta - a.restanta);
+
+        const totalRestanta = overdue.reduce((sum: number, c: { restanta: number }) => sum + c.restanta, 0);
+        const top5 = overdue.slice(0, 5).map((c: { nume_client: string; restanta: number; intarziere: number }) => ({
+          client: c.nume_client,
+          restanta: c.restanta,
+          zile: c.intarziere,
+        }));
+
+        return JSON.stringify({
+          clienti_restanti: overdue.length,
+          total_restanta_RON: Math.round(totalRestanta * 100) / 100,
+          top_5: top5,
+        });
       }
 
       // --- Scheduled Messages ---
