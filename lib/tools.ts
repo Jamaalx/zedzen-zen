@@ -448,24 +448,23 @@ export async function executeTool(name: string, args: Record<string, unknown>, u
 
       // --- Nexus ERP ---
       case "nexus_clients_balances": {
-        const NEXUS_URL = process.env.NEXUS_API_URL || "http://86.125.184.78:8008";
-        const NEXUS_KEY = process.env.NEXUS_API_KEY || "60E12DA32A7A4D10A8555253363ACFF4";
-        const auth = Buffer.from(NEXUS_KEY + ":").toString("base64");
-        const headers = { Authorization: `Basic ${auth}`, "Content-Type": "application/json" };
+        const NEXUS_DASH = process.env.NEXUS_DASHBOARD_URL || "https://nexus-dashboard-production-e5ef.up.railway.app";
+        const NEXUS_SERVICE_KEY = process.env.NEXUS_SERVICE_KEY || "";
+        const headers = { "x-api-key": NEXUS_SERVICE_KEY, "Content-Type": "application/json" };
 
-        const res = await fetch(`${NEXUS_URL}/api/v3/read/sold_clienti`, {
-          method: "POST", headers, body: "{}",
+        const res = await fetch(`${NEXUS_DASH}/api/nexus/clients`, {
+          headers,
         });
         const data = await res.json();
         if (!Array.isArray(data)) return `EROARE: ${JSON.stringify(data)}`;
 
         const clients = data
-          .filter((c: { restanta?: number; sold?: number }) => (c.restanta || 0) !== 0 || (c.sold || 0) !== 0)
-          .map((c: { nume_client: string; restanta: number; sold: number; intarziere: number }) => ({
-            client: c.nume_client,
-            restanta: c.restanta || 0,
-            sold: c.sold || 0,
-            zile_intarziere: c.intarziere || 0,
+          .filter((c: { sold_restant?: number; sold_total?: number }) => (c.sold_restant || 0) !== 0 || (c.sold_total || 0) !== 0)
+          .map((c: { denumire: string; sold_restant: number; sold_total: number; nr_facturi_neplatite: number }) => ({
+            client: c.denumire,
+            restanta: c.sold_restant || 0,
+            sold: c.sold_total || 0,
+            facturi_neplatite: c.nr_facturi_neplatite || 0,
           }))
           .sort((a: { restanta: number }, b: { restanta: number }) => b.restanta - a.restanta);
 
@@ -473,14 +472,13 @@ export async function executeTool(name: string, args: Record<string, unknown>, u
       }
 
       case "nexus_client_invoices": {
-        const NEXUS_URL = process.env.NEXUS_API_URL || "http://86.125.184.78:8008";
-        const NEXUS_KEY = process.env.NEXUS_API_KEY || "60E12DA32A7A4D10A8555253363ACFF4";
-        const auth = Buffer.from(NEXUS_KEY + ":").toString("base64");
-        const headers = { Authorization: `Basic ${auth}`, "Content-Type": "application/json" };
+        const NEXUS_DASH = process.env.NEXUS_DASHBOARD_URL || "https://nexus-dashboard-production-e5ef.up.railway.app";
+        const NEXUS_SERVICE_KEY = process.env.NEXUS_SERVICE_KEY || "";
+        const headers = { "x-api-key": NEXUS_SERVICE_KEY, "Content-Type": "application/json" };
 
         // Get all invoices
-        const res = await fetch(`${NEXUS_URL}/api/v3/read/facturi_clienti`, {
-          method: "POST", headers, body: "{}",
+        const res = await fetch(`${NEXUS_DASH}/api/nexus/invoices`, {
+          headers,
         });
         const data = await res.json();
         if (!Array.isArray(data)) return `EROARE: ${JSON.stringify(data)}`;
@@ -504,26 +502,25 @@ export async function executeTool(name: string, args: Record<string, unknown>, u
       }
 
       case "nexus_overdue_summary": {
-        const NEXUS_URL = process.env.NEXUS_API_URL || "http://86.125.184.78:8008";
-        const NEXUS_KEY = process.env.NEXUS_API_KEY || "60E12DA32A7A4D10A8555253363ACFF4";
-        const auth = Buffer.from(NEXUS_KEY + ":").toString("base64");
-        const headers = { Authorization: `Basic ${auth}`, "Content-Type": "application/json" };
+        const NEXUS_DASH = process.env.NEXUS_DASHBOARD_URL || "https://nexus-dashboard-production-e5ef.up.railway.app";
+        const NEXUS_SERVICE_KEY = process.env.NEXUS_SERVICE_KEY || "";
+        const headers = { "x-api-key": NEXUS_SERVICE_KEY, "Content-Type": "application/json" };
 
-        const res = await fetch(`${NEXUS_URL}/api/v3/read/sold_clienti`, {
-          method: "POST", headers, body: "{}",
+        const res = await fetch(`${NEXUS_DASH}/api/nexus/clients`, {
+          headers,
         });
         const data = await res.json();
         if (!Array.isArray(data)) return `EROARE: ${JSON.stringify(data)}`;
 
         const overdue = data
-          .filter((c: { restanta?: number }) => (c.restanta || 0) > 0)
-          .sort((a: { restanta: number }, b: { restanta: number }) => b.restanta - a.restanta);
+          .filter((c: { sold_restant?: number }) => (c.sold_restant || 0) > 0)
+          .sort((a: { sold_restant: number }, b: { sold_restant: number }) => b.sold_restant - a.sold_restant);
 
-        const totalRestanta = overdue.reduce((sum: number, c: { restanta: number }) => sum + c.restanta, 0);
-        const top5 = overdue.slice(0, 5).map((c: { nume_client: string; restanta: number; intarziere: number }) => ({
-          client: c.nume_client,
-          restanta: c.restanta,
-          zile: c.intarziere,
+        const totalRestanta = overdue.reduce((sum: number, c: { sold_restant: number }) => sum + c.sold_restant, 0);
+        const top5 = overdue.slice(0, 5).map((c: { denumire: string; sold_restant: number; nr_facturi_neplatite: number }) => ({
+          client: c.denumire,
+          restanta: c.sold_restant,
+          facturi: c.nr_facturi_neplatite,
         }));
 
         return JSON.stringify({
