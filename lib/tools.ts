@@ -217,8 +217,9 @@ export const toolSchemas: ChatCompletionTool[] = [
 // TOOL EXECUTORS
 // =============================================
 
-export async function executeTool(name: string, args: Record<string, unknown>, userRole: string, chatId: string): Promise<string> {
+export async function executeTool(name: string, args: Record<string, unknown>, userRole: string, chatId: string, organizationId?: string): Promise<string> {
   const db = getDb();
+  const orgFilter = organizationId || null;
 
   // Permission check for admin-only tools
   const adminTools = ["add_knowledge", "edit_knowledge", "delete_knowledge", "list_users", "add_user", "edit_user", "view_logs"];
@@ -283,7 +284,9 @@ export async function executeTool(name: string, args: Record<string, unknown>, u
 
       // --- Knowledge ---
       case "search_knowledge": {
-        const { data } = await db.from("zen_knowledge").select("category, title, content").eq("is_active", true);
+        let q = db.from("zen_knowledge").select("category, title, content").eq("is_active", true);
+        if (orgFilter) q = q.eq("organization_id", orgFilter);
+        const { data } = await q;
         // Simple keyword search
         const query = String(args.query || "").toLowerCase();
         const results = (data || []).filter(
@@ -297,7 +300,9 @@ export async function executeTool(name: string, args: Record<string, unknown>, u
           : "Nu am gasit informatii relevante in baza de cunostinte.";
       }
       case "list_knowledge": {
-        const { data } = await db.from("zen_knowledge").select("id, category, title").eq("is_active", true).order("category");
+        let q = db.from("zen_knowledge").select("id, category, title").eq("is_active", true);
+        if (orgFilter) q = q.eq("organization_id", orgFilter);
+        const { data } = await q.order("category");
         return JSON.stringify((data || []).map((k: { id: string; category: string; title: string }) => ({
           id: k.id.slice(0, 8),
           category: k.category,
@@ -306,7 +311,7 @@ export async function executeTool(name: string, args: Record<string, unknown>, u
       }
       case "add_knowledge": {
         const { data, error } = await db.from("zen_knowledge")
-          .insert({ category: args.category, title: args.title, content: args.content })
+          .insert({ category: args.category, title: args.title, content: args.content, organization_id: orgFilter })
           .select("id").single();
         if (error) return `EROARE: ${error.message}`;
         return `Articol adaugat cu ID: ${(data as { id: string }).id.slice(0, 8)}`;
@@ -330,13 +335,15 @@ export async function executeTool(name: string, args: Record<string, unknown>, u
 
       // --- Users ---
       case "list_users": {
-        const { data } = await db.from("zen_users").select("phone, name, role, is_active, last_login_at").order("name");
+        let q = db.from("zen_users").select("phone, name, role, is_active, last_login_at");
+        if (orgFilter) q = q.eq("organization_id", orgFilter);
+        const { data } = await q.order("name");
         return JSON.stringify(data);
       }
       case "add_user": {
         const phone = String(args.phone).replace(/[^0-9]/g, "").replace(/^0/, "40");
         const { error } = await db.from("zen_users").insert({
-          phone, name: args.name, pin: args.pin, role: args.role,
+          phone, name: args.name, pin: args.pin, role: args.role, organization_id: orgFilter,
         });
         if (error) return error.code === "23505" ? "EROARE: Numarul exista deja." : `EROARE: ${error.message}`;
         await sendText(phone, `🤖 Bun venit la *ZEN Bot*!\nPIN-ul tau: *${args.pin}*\nTrimite PIN-ul pentru autentificare.`);
@@ -361,9 +368,9 @@ export async function executeTool(name: string, args: Record<string, unknown>, u
       // --- Logs ---
       case "view_logs": {
         const limit = Number(args.limit) || 10;
-        const { data } = await db.from("zen_logs")
-          .select("user_phone, command, status, execution_ms, created_at")
-          .order("created_at", { ascending: false }).limit(limit);
+        let q = db.from("zen_logs").select("user_phone, command, status, execution_ms, created_at");
+        if (orgFilter) q = q.eq("organization_id", orgFilter);
+        const { data } = await q.order("created_at", { ascending: false }).limit(limit);
         return JSON.stringify(data);
       }
 

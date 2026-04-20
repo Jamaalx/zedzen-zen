@@ -29,6 +29,8 @@ interface User {
   pin: string;
   role: string;
   is_active: boolean;
+  organization_id: string | null;
+  org_name?: string;
 }
 
 const SESSION_DURATION_MS = 24 * 60 * 60 * 1000;
@@ -73,6 +75,7 @@ async function authenticateSession(session: Session, user: User): Promise<void> 
     .from("zen_sessions")
     .update({
       user_id: user.id,
+      organization_id: user.organization_id,
       is_authenticated: true,
       expires_at: new Date(Date.now() + SESSION_DURATION_MS).toISOString(),
       updated_at: new Date().toISOString(),
@@ -91,6 +94,7 @@ async function logAction(session: Session, user: User, command: string, input: s
     session_id: session.id,
     user_id: user.id,
     user_phone: user.phone,
+    organization_id: user.organization_id,
     command,
     input,
     output: output.slice(0, 2000),
@@ -104,8 +108,10 @@ async function logAction(session: Session, user: User, command: string, input: s
 // =============================================
 
 function buildSystemPrompt(user: User): string {
-  return `Esti ZEN, asistentul AI al restaurantului Ciorbe si Placinte. Vorbesti in romana, esti concis si profesional.
+  const orgName = user.org_name || "ZED-ZEN";
+  return `Esti ZEN, asistentul AI al restaurantului "${orgName}". Vorbesti in romana, esti concis si profesional.
 
+ORGANIZATIE: ${orgName}
 UTILIZATOR CURENT: ${user.name} (rol: ${user.role}, telefon: ${user.phone})
 
 CE POTI FACE:
@@ -177,7 +183,7 @@ async function runAgent(userMessage: string, user: User, chatId: string): Promis
         toolArgs = JSON.parse(tc.function?.arguments || tc.arguments || "{}");
       } catch { /* empty args */ }
 
-      const result = await executeTool(toolName, toolArgs, user.role, chatId);
+      const result = await executeTool(toolName, toolArgs, user.role, chatId, user.organization_id || undefined);
 
       messages.push({
         role: "tool",
@@ -202,7 +208,9 @@ export async function handleMessage(chatId: string, text: string): Promise<void>
   // --- Not authenticated: expect PIN ---
   if (!session.is_authenticated) {
     const phone = chatId.replace("@s.whatsapp.net", "").replace("@c.us", "");
-    const { data: user } = await db.from("zen_users").select("*").eq("phone", phone).eq("is_active", true).single();
+    const { data: user } = await db.from("zen_users")
+      .select("*, org:zen_organizations(name)")
+      .eq("phone", phone).eq("is_active", true).single();
 
     if (!user) {
       await sendText(chatId, "🔒 Nu ai acces. Contacteaza un administrator.");
@@ -214,14 +222,19 @@ export async function handleMessage(chatId: string, text: string): Promise<void>
       return;
     }
 
-    await authenticateSession(session, user as User);
-    await sendText(chatId, `✅ Bun venit, *${user.name}*! (${user.role})\n\n🤖 Sunt ZEN, asistentul tau. Scrie orice - eu ma descurc.`);
+    const u = user as User & { org?: { name: string } };
+    u.org_name = u.org?.name || "ZED-ZEN";
+
+    await authenticateSession(session, u);
+    await sendText(chatId, `✅ Bun venit, *${u.name}*! (${u.role})\n📍 ${u.org_name}\n\n🤖 Sunt ZEN, asistentul tau. Scrie orice - eu ma descurc.`);
     await logAction(session, user as User, "login", "", "ok", "success", startTime);
     return;
   }
 
   // --- Authenticated: run agent ---
-  const { data: user } = await db.from("zen_users").select("*").eq("id", session.user_id).single();
+  const { data: user } = await db.from("zen_users")
+    .select("*, org:zen_organizations(name)")
+    .eq("id", session.user_id).single();
   if (!user) {
     await sendText(chatId, "❌ Sesiune invalida. Trimite PIN-ul.");
     await db.from("zen_sessions").update({ is_authenticated: false }).eq("id", session.id);
