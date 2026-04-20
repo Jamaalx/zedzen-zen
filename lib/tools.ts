@@ -199,6 +199,23 @@ export const toolSchemas: ChatCompletionTool[] = [
   {
     type: "function",
     function: {
+      name: "update_supplier",
+      description: "Actualizeaza datele unui furnizor existent (telefon, email, persoana de contact, WhatsApp chat ID). Foloseste cand cineva vrea sa schimbe nr de telefon sau alte date la un furnizor.",
+      parameters: {
+        type: "object",
+        properties: {
+          supplier_name: { type: "string", description: "Numele furnizorului (ex: Neo Bussines, Alver Green, Pepsi Buzesti)" },
+          phone: { type: "string", description: "Noul numar de telefon (optional)" },
+          contact_name: { type: "string", description: "Noua persoana de contact (optional)" },
+          email: { type: "string", description: "Noul email (optional)" },
+        },
+        required: ["supplier_name"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
       name: "send_whatsapp_message",
       description: "Trimite un mesaj WhatsApp catre un numar de telefon sau chat ID",
       parameters: {
@@ -372,6 +389,54 @@ export async function executeTool(name: string, args: Record<string, unknown>, u
         if (orgFilter) q = q.eq("organization_id", orgFilter);
         const { data } = await q.order("created_at", { ascending: false }).limit(limit);
         return JSON.stringify(data);
+      }
+
+      // --- Suppliers ---
+      case "update_supplier": {
+        // First find the supplier by name
+        const res = await fetch(`${MANAGER_URL}/api/suppliers`, {
+          headers: { Authorization: `Bearer ${MANAGER_SECRET}` },
+        });
+        const suppliers = await res.json();
+        if (!Array.isArray(suppliers)) return "EROARE: Nu pot accesa lista de furnizori.";
+
+        const name = String(args.supplier_name).toLowerCase();
+        const supplier = suppliers.find(
+          (s: { name: string }) => s.name.toLowerCase().includes(name) || name.includes(s.name.toLowerCase())
+        );
+        if (!supplier) return `EROARE: Furnizorul "${args.supplier_name}" nu a fost gasit. Furnizori existenti: ${suppliers.map((s: { name: string }) => s.name).join(", ")}`;
+
+        // Build update payload
+        const update: Record<string, string> = {};
+        if (args.phone) {
+          const clean = String(args.phone).replace(/[^0-9]/g, "");
+          update.phone = String(args.phone);
+          update.wa_chat_id = (clean.startsWith("0") ? "4" + clean : clean) + "@s.whatsapp.net";
+        }
+        if (args.contact_name) update.contact_name = String(args.contact_name);
+        if (args.email) update.email = String(args.email);
+
+        if (Object.keys(update).length === 0) return "EROARE: Trebuie sa specifici cel putin un camp de actualizat (phone, contact_name, email).";
+
+        // Update via Supabase REST (manager's Supabase)
+        const MANAGER_SUPABASE_URL = process.env.MANAGER_SUPABASE_URL || "https://eqqvjrxkvqaptydzxvwx.supabase.co";
+        const MANAGER_SUPABASE_KEY = process.env.MANAGER_SUPABASE_KEY || MANAGER_SECRET;
+
+        const patchRes = await fetch(`${MANAGER_SUPABASE_URL}/rest/v1/suppliers?id=eq.${supplier.id}`, {
+          method: "PATCH",
+          headers: {
+            apikey: MANAGER_SUPABASE_KEY,
+            Authorization: `Bearer ${MANAGER_SUPABASE_KEY}`,
+            "Content-Type": "application/json",
+            Prefer: "return=representation",
+          },
+          body: JSON.stringify(update),
+        });
+        const result = await patchRes.json();
+        if (patchRes.ok) {
+          return `Furnizor "${supplier.name}" actualizat: ${Object.entries(update).filter(([k]) => k !== "wa_chat_id").map(([k, v]) => `${k}=${v}`).join(", ")}`;
+        }
+        return `EROARE: ${JSON.stringify(result)}`;
       }
 
       // --- WhatsApp ---
